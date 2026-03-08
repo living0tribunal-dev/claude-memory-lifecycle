@@ -1,0 +1,184 @@
+{
+  "env": {
+    "GEMINI_API_KEY": "YOUR_GEMINI_API_KEY_HERE"
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/auto-session-save.py",
+            "timeout": 60000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/graceful-shutdown.py",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/scripts/memory-buffer.py age",
+            "timeout": 120000,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/pretool-3gate.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/circuit-breaker.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/loop-detector.py",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/research-gate.py",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/block-secrets.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/settings-guard.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/claudemd-guard.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/write-gate.py check-write",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/block-secrets.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/settings-guard.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/claudemd-guard.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/write-gate.py track-read",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/agent-results-persist.py",
+            "timeout": 5000,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/focus-nudge.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/gemini-checker.py inject",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/subtopic-awareness.py awareness",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/context-watchdog.py",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/write-gate.py reset",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/stop-self-check.py",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/gemini-checker.py check",
+            "timeout": 30000,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/subtopic-awareness.py drift",
+            "timeout": 120000,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
