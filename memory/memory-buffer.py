@@ -136,6 +136,7 @@ def get_db():
         conn.execute("""
             UPDATE buffer_entries SET entry_type = CASE
                 WHEN text LIKE 'AUTO-SESSION-SAVE%' THEN 'auto-session-save'
+                WHEN substr(text, 1, 300) LIKE '%#decision%' OR substr(text, 1, 300) LIKE '%#entscheidung%' THEN 'decision'
                 WHEN substr(text, 1, 300) LIKE '%#user-gedanke%' THEN 'user-gedanke'
                 WHEN substr(text, 1, 300) LIKE '%#session-save%' THEN 'session-save'
                 ELSE 'insight'
@@ -206,12 +207,15 @@ def compute_hash(text):
 
 
 def detect_entry_type(text):
-    """Detect entry type from text content. Priority: auto > user-gedanke > session-save > insight."""
+    """Detect entry type from text content. Priority: auto > decision > user-gedanke > session-save > insight."""
     if text.strip().startswith('AUTO-SESSION-SAVE'):
         return 'auto-session-save'
-    if '#user-gedanke' in text[:300]:
+    first_300 = text[:300]
+    if '#decision' in first_300 or '#entscheidung' in first_300:
+        return 'decision'
+    if '#user-gedanke' in first_300:
         return 'user-gedanke'
-    if '#session-save' in text[:300]:
+    if '#session-save' in first_300:
         return 'session-save'
     return 'insight'
 
@@ -2162,7 +2166,7 @@ def cmd_age(args):
     candidates_raw = conn.execute(
         "SELECT id, text, project, reprieve_count FROM buffer_entries "
         "WHERE state = 'buffer' AND (? - id) >= ? "
-        "AND (entry_type IS NULL OR entry_type != 'user-gedanke')",
+        "AND (entry_type IS NULL OR entry_type NOT IN ('user-gedanke', 'decision'))",
         (max_id, threshold)
     ).fetchall()
 

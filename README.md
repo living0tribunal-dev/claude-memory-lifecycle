@@ -45,11 +45,11 @@ Every piece of information passes through a 5-phase lifecycle:
 
 ### Connection-Based Expiry
 
-Most memory systems use TTL (time-to-live). An entry expires after N days regardless of its value. We use **isolation**: an entry expires because nothing connects to it. A months-old API endpoint that's still referenced by other knowledge stays. Yesterday's typo fix that connects to nothing fades.
+Most memory systems use time-based expiry — TTL or decay functions like Ebbinghaus curves. An entry fades after N epochs regardless of its connections. We use **isolation**: an entry expires because nothing connects to it. A months-old API endpoint that's still referenced by other knowledge stays. Yesterday's typo fix that connects to nothing fades.
 
 ### Diamond Protection
 
-Some entries are valuable *because* they're unique — they don't cluster with anything. Before expiring an isolated entry, a substance check evaluates whether it contains genuine, standalone knowledge. Valuable loners get reprieved. This prevents the system from destroying rare insights.
+Some entries are valuable *because* they're unique — they don't cluster with anything. Before expiring an isolated entry, a substance check evaluates whether it contains genuine, standalone knowledge. Valuable loners get reprieved (up to 3 times). Unlike static permanent-memory flags (where the user decides upfront what's important), diamond protection is automatic — the system discovers valuable loners during the aging process.
 
 ### Memory Type Classification
 
@@ -57,6 +57,7 @@ Entries are automatically classified from content at write time:
 
 | Type | Detection | Behavior |
 |------|-----------|----------|
+| `decision` | `#decision` or `#entscheidung` tag | Never auto-expires (decisions are foundational — format: WHAT + BECAUSE + CONSEQUENCE) |
 | `user-gedanke` | `#user-gedanke` tag | Never auto-expires (user's explicit thoughts are sacred) |
 | `session-save` | `#session-save` tag | Normal lifecycle — consolidation and aging |
 | `auto-session-save` | `AUTO-SESSION-SAVE` prefix | Immediately expired if empty (0 user messages) |
@@ -121,7 +122,7 @@ The system has three layers that work independently:
 | Embedding model | Qwen3-0.6B ONNX INT8 — local, no API, ~1s for 10 entries, ~500MB RAM (chosen for laptop compatibility; larger models improve quality but require more RAM) |
 | Consolidation model | Any LLM with JSON mode (default: Gemini 2.5 Flash, free tier) |
 | Quality checker model | Any LLM with chat API (default: Gemini 3.1 Flash-Lite, free tier, 1000 RPD) |
-| Memory types | 4 (auto-detected from content) |
+| Memory types | 5 (auto-detected from content) |
 
 ## Empirical Evaluation
 
@@ -156,8 +157,10 @@ No academic benchmarks (LoCoMo, LongMemEval) — those measure retrieval accurac
 | System | Memory Model | Expiry | Quality Check | Integration |
 |--------|-------------|--------|---------------|-------------|
 | **This system** | Connection-based lifecycle | Isolation + substance check | LLM cross-check | Hooks (no fork) |
+| [claude-mem](https://github.com/thedotmack/claude-mem) | Observation capture + compress | None | LLM compression | Claude Code hooks |
+| [engram-rs](https://github.com/kael-bit/engram-rs) | Atkinson-Shiffrin 3-layer | Ebbinghaus decay (3 half-lives) | LLM quality gate | MCP + CLI (Rust) |
+| [engram-ai-memory](https://github.com/foramoment/engram-ai-memory) | 5-type knowledge graph | Ebbinghaus + permanent exemptions | Noise gate | MCP server |
 | Claude auto-memory | Flat files, append-only | None | None | Built-in |
-| [engram-rs](https://github.com/engram-rs) | 3-layer, epoch-decay | Time-based | LLM quality gate | Custom CLI |
 | [Copilot Memory](https://docs.github.com/en/copilot) | Citation-verification | Self-healing | Runtime citation check | Built-in |
 | [SimpleMem](https://arxiv.org/abs/2601.02553) | CLS-theory | Decay function | Benchmarked | Research prototype |
 | [MemOS](https://github.com/MemOS) | Governance + TTL | Time-based + policy | Conflict detection | Framework |
