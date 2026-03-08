@@ -10,8 +10,8 @@
 ## Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-memory-system.git
-cd claude-memory-system
+git clone https://github.com/living0tribunal-dev/claude-memory-lifecycle.git
+cd claude-memory-lifecycle
 ```
 
 ## Step 2: Install Python Dependencies
