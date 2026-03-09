@@ -105,6 +105,6 @@ The entire system is a single Python script (~2,300 lines) plus hook scripts. No
 
 The system is open source: [github.com/living0tribunal-dev/claude-memory-lifecycle](https://github.com/living0tribunal-dev/claude-memory-lifecycle)
 
-A detailed technical report is available in the repository.
+A detailed technical report is available in the repository. The project is archived on Zenodo: [DOI 10.5281/zenodo.18926259](https://doi.org/10.5281/zenodo.18926259).
 
 One observation stayed with me after building this. I started from practical problems: noise, no lifecycle, no forgetting. I worked bottom-up, from data to patterns to architecture. The resulting system turned out to mirror Complementary Learning Systems theory from neuroscience: fast buffer learning, slow consolidation into persistent storage, connected by replay. Whether that reflects a deep structural constraint on how knowledge management must work, or simply the obviousness of buffer-plus-consolidation as a pattern, is a question I cannot answer. But the convergence is there.

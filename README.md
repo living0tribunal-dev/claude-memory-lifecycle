@@ -1,5 +1,7 @@
 # Claude Memory System
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18926259.svg)](https://doi.org/10.5281/zenodo.18926259)
+
 **A cognitive layer for Claude Code — memory lifecycle, quality assurance, and safety — built entirely with hooks.**
 
 Most LLM memory systems store everything and forget nothing. The result: after a few weeks, your memory files are full of duplicates, outdated facts, and noise. The real problem isn't storage — it's *forgetting*.
