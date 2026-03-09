@@ -1,0 +1,30 @@
+{
+  "title": "Claude Memory Lifecycle: Connection-Based Memory Management for Claude Code",
+  "description": "A cognitive layer for Claude Code that implements biological memory principles — entries that connect to other knowledge survive, isolated ones fade. Built entirely with hooks, using local embeddings (Qwen3-0.6B ONNX) and Gemini Flash Lite for quality assurance. Features a 6-stage lifecycle (buffer → connections → clusters → consolidation → routing → aging), automatic noise filtering, diamond protection for high-value memories, and cross-system conflict detection.",
+  "creators": [
+    {
+      "name": "Pittinger, Thomas",
+      "affiliation": ""
+    }
+  ],
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "keywords": [
+    "claude-code",
+    "ai-memory",
+    "memory-management",
+    "llm-tools",
+    "memory-lifecycle",
+    "embeddings",
+    "cognitive-architecture"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/living0tribunal-dev/claude-memory-lifecycle",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ],
+  "version": "1.0.0"
+}
