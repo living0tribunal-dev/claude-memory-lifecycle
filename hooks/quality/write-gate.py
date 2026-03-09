@@ -1,32 +1,47 @@
 #!/usr/bin/env python3
-"""Write-Gate: Verhindert grosse Writes ohne vorheriges Lesen.
+"""Write-Gate: Verhindert Writes/Edits ohne vorheriges Lesen der Zieldatei.
 
 Gate-3 Mechanismus (Stufe 1 — Hook, nicht umgehbar).
-Zaehlt Read-Aufrufe pro User-Prompt. Blockt grosse Writes wenn zu wenig gelesen wurde.
+Trackt gelesene und geschriebene Dateien pro Prompt.
+Blockt Mutations an Dateien die in diesem Prompt nicht gelesen/geschrieben wurden.
 
 Modes:
-  reset       → UserPromptSubmit: Read-Counter auf 0 setzen
-  track-read  → PostToolUse:Read: Gelesene Datei registrieren
-  check-write → PreToolUse:Write: Grosse Writes ohne genug Reads blocken
+  reset       → UserPromptSubmit: Tracking auf 0 setzen
+  track-read  → PostToolUse:Read/Write: Datei-Pfad registrieren
+  check-write → PreToolUse:Write/Edit: Mutation ohne Lesen blocken
 """
 
 import sys
 import json
 import os
 import time
+import hashlib
 
-# Schwellen
+# Schwellen (nur fuer neue Dateien via Write)
 LARGE_WRITE_THRESHOLD = 5000   # Zeichen — darunter kein Check
 MIN_READS_FOR_LARGE_WRITE = 3  # Unique Dateien
 
-# State
+# State — CWD-basierte Isolation (verschiedene Projekte = verschiedene State-Files)
 STATE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "claude-write-gate")
-STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+
+def get_state_file():
+    """Session-spezifisches State-File basierend auf CWD."""
+    cwd = os.getcwd()
+    cwd_hash = hashlib.md5(cwd.encode()).hexdigest()[:8]
+    return os.path.join(STATE_DIR, f"state-{cwd_hash}.json")
+
+
+def normalize_path(p):
+    """Normalize path for consistent comparison across path formats."""
+    if not p:
+        return ""
+    return os.path.normpath(p).lower()
 
 
 def load_state():
     try:
-        with open(STATE_FILE, 'r') as f:
+        with open(get_state_file(), 'r') as f:
             return json.load(f)
     except Exception:
         return {"reads": [], "last_reset": ""}
@@ -34,7 +49,7 @@ def load_state():
 
 def save_state(state):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE_FILE, 'w') as f:
+    with open(get_state_file(), 'w') as f:
         json.dump(state, f)
 
 
@@ -46,7 +61,7 @@ def get_hook_input():
 
 
 def handle_reset():
-    """UserPromptSubmit: Reset read counter."""
+    """UserPromptSubmit: Reset tracking."""
     get_hook_input()  # consume stdin
     state = {"reads": [], "last_reset": time.strftime("%Y-%m-%dT%H:%M:%S")}
     save_state(state)
@@ -54,49 +69,74 @@ def handle_reset():
 
 
 def handle_track_read(hook_input):
-    """PostToolUse:Read: Track file path."""
+    """PostToolUse:Read/Write: Track file path."""
     tool_input = hook_input.get("tool_input", {})
     file_path = tool_input.get("file_path", "")
 
     if not file_path:
         sys.exit(0)
 
+    norm = normalize_path(file_path)
     state = load_state()
-    if file_path not in state["reads"]:
-        state["reads"].append(file_path)
+    if norm not in state["reads"]:
+        state["reads"].append(norm)
         save_state(state)
 
     sys.exit(0)
 
 
 def handle_check_write(hook_input):
-    """PreToolUse:Write: Block large writes without enough reads."""
+    """PreToolUse:Write/Edit: Block mutations without reading the target file."""
     tool_input = hook_input.get("tool_input", {})
-    content = tool_input.get("content", "")
+    tool_name = hook_input.get("tool_name", "Write")
+    file_path = tool_input.get("file_path", "")
 
-    content_len = len(content)
-
-    if content_len < LARGE_WRITE_THRESHOLD:
+    if not file_path:
         sys.exit(0)
 
+    norm = normalize_path(file_path)
     state = load_state()
-    read_count = len(state.get("reads", []))
+    tracked = [normalize_path(p) for p in state.get("reads", [])]
 
-    if read_count < MIN_READS_FOR_LARGE_WRITE:
+    # Identity check: is the target file in tracked files?
+    if norm in tracked:
+        sys.exit(0)
+
+    # File not tracked — distinguish new file creation from existing file mutation
+    is_new_file = (tool_name == "Write" and not os.path.exists(file_path))
+
+    if is_new_file:
+        # New file: apply quantity check (need enough research before large writes)
+        content = tool_input.get("content", "")
+        if len(content) < LARGE_WRITE_THRESHOLD:
+            sys.exit(0)  # Small new files pass
+        if len(tracked) >= MIN_READS_FOR_LARGE_WRITE:
+            sys.exit(0)  # Enough research done
         output = {
             "hookSpecificOutput": {
                 "message": (
-                    f"GATE-3 MECHANISMUS: Du schreibst {content_len} Zeichen "
-                    f"aber hast nur {read_count} Datei(en) in diesem Prompt gelesen. "
+                    f"GATE-3: Neue Datei mit {len(content)} Zeichen, "
+                    f"aber nur {len(tracked)} Datei(en) gelesen. "
                     f"Minimum: {MIN_READS_FOR_LARGE_WRITE} Reads vor einem grossen Write. "
-                    f"Lies zuerst die Quellen."
+                    f"Lies zuerst die relevanten Quellen."
                 )
             }
         }
         print(json.dumps(output))
         sys.exit(2)
-
-    sys.exit(0)
+    else:
+        # Existing file: MUST have been read/written this prompt
+        output = {
+            "hookSpecificOutput": {
+                "message": (
+                    f"GATE-3: Du editierst/ueberschreibst '{os.path.basename(file_path)}' "
+                    f"aber hast diese Datei in diesem Prompt nicht gelesen. "
+                    f"Erst Read('{file_path}'), dann {tool_name}."
+                )
+            }
+        }
+        print(json.dumps(output))
+        sys.exit(2)
 
 
 if __name__ == "__main__":
