@@ -80,7 +80,7 @@ Zero modifications to Claude Code. Everything runs through the [official hooks A
 | Hook Event | What Runs |
 |------------|-----------|
 | `UserPromptSubmit` | Context injection, focus checks, Gemini violation feedback, write-gate reset |
-| `PreToolUse` | 3-gate checks, write-gate enforcement |
+| `PreToolUse` | 3-gate checks, write-gate enforcement, violation enforcement |
 | `PostToolUse` | Read tracking, agent result persistence |
 | `Stop` | Self-checks, Gemini quality checker |
 | `PreCompact` | Session save, embedding updates, aging pipeline, graceful shutdown |
@@ -100,6 +100,7 @@ The system has three layers that work independently:
 - `gemini-checker.py` — Gemini reviews Claude's responses against rules (async, two-mode: check + inject)
 - `stop-self-check.py` — Pattern-based self-check (length, workaround detection)
 - `write-gate.py` — Blocks writes if Claude hasn't read enough files first (Gate-3 mechanism)
+- `violation-enforcer.py` — Deferred enforcement of Gemini-detected violations (blocks Write/Edit until resolved)
 - `research-gate.py` — Enforces research workflow (inventory before research)
 - `focus-nudge.py` — Periodic focus checks
 
