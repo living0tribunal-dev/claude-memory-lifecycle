@@ -7,25 +7,31 @@ LOOP-SCHUTZ:
 1. stop_hook_active Flag pruefen
 2. Eigener Zaehler (max MAX_BLOCKS Blocks pro Session)
 3. Schwellwert fuer lange Antworten
+
+SESSION-ISOLATION:
+Counter-Dateien sind session-spezifisch (via session_id aus Hook-Input).
+Parallele Claude-Code-Sessions teilen keine Counter mehr.
 """
+import hashlib
 import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 # Config
 MAX_BLOCKS = 2
-LENGTH_THRESHOLD = 2500
+LENGTH_THRESHOLD = 5000
 STATE_DIR = Path.home() / ".claude" / "state"
 LOG_DIR = Path.home() / ".claude" / "logs"
-COUNTER_FILE = STATE_DIR / "stop_check_count"
-PLAN_GATE_COUNTER_FILE = STATE_DIR / "plan_gate_count"
 PLAN_GATE_MAX_BLOCKS = 1
-WORKAROUND_COUNTER_FILE = STATE_DIR / "workaround_count"
 WORKAROUND_MAX_BLOCKS = 1
+GATE3_MAX_BLOCKS = 2
+GATE3_MIN_LENGTH = 500
 TRACKER_FILE = os.path.join(os.environ.get("TEMP", "/tmp"), "claude-research-tracker.json")
+COUNTER_PREFIXES = ("stop_check_count_", "plan_gate_count_", "workaround_count_", "gate3_read_count_")
 
 def log(message):
     try:
@@ -36,60 +42,35 @@ def log(message):
     except Exception:
         pass
 
-def get_counter():
-    """Zaehler lesen und inkrementieren."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = str(COUNTER_FILE) + ".lock"
 
-    # Einfaches File-Locking via increment_counter.py Muster
+def get_counter_value(counter_file):
+    """Read counter, increment, write back."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        count = int(COUNTER_FILE.read_text().strip())
+        count = int(counter_file.read_text().strip())
     except Exception:
         count = 0
     count += 1
-    COUNTER_FILE.write_text(str(count))
-    return count
-
-def reset_counter():
-    try:
-        COUNTER_FILE.write_text("0")
-    except Exception:
-        pass
-
-def get_plan_gate_counter():
-    """Eigener Zaehler fuer Plan-Gate (getrennt von Length-Check)."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        count = int(PLAN_GATE_COUNTER_FILE.read_text().strip())
-    except Exception:
-        count = 0
-    count += 1
-    PLAN_GATE_COUNTER_FILE.write_text(str(count))
+    counter_file.write_text(str(count))
     return count
 
 
-def reset_plan_gate_counter():
+def reset_counter_value(counter_file):
+    """Reset counter to 0."""
     try:
-        PLAN_GATE_COUNTER_FILE.write_text("0")
+        counter_file.write_text("0")
     except Exception:
         pass
 
 
-def get_workaround_counter():
-    """Eigener Zaehler fuer Workaround-Check."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+def cleanup_stale_counters(max_age_hours=24):
+    """Remove session-specific counter files older than max_age_hours."""
     try:
-        count = int(WORKAROUND_COUNTER_FILE.read_text().strip())
-    except Exception:
-        count = 0
-    count += 1
-    WORKAROUND_COUNTER_FILE.write_text(str(count))
-    return count
-
-
-def reset_workaround_counter():
-    try:
-        WORKAROUND_COUNTER_FILE.write_text("0")
+        now = time.time()
+        for f in STATE_DIR.iterdir():
+            if any(f.name.startswith(p) for p in COUNTER_PREFIXES):
+                if now - f.stat().st_mtime > max_age_hours * 3600:
+                    f.unlink()
     except Exception:
         pass
 
@@ -186,6 +167,53 @@ def check_research_coverage():
     return "\n".join(lines)
 
 
+def check_gate3_reads(response):
+    """Prueft ob Claude Dateien gelesen hat bevor er technisch antwortet (Gate-3)."""
+    # Kurze Antworten = Chat, nicht technisch
+    if len(response) < GATE3_MIN_LENGTH:
+        return None
+
+    # Write-Gate State lesen (trackt Read/Write/Grep/Glob)
+    try:
+        cwd = os.getcwd()
+        cwd_hash = hashlib.md5(cwd.encode()).hexdigest()[:8]
+        state_dir = os.path.join(os.environ.get("TEMP", "/tmp"), "claude-write-gate")
+        state_file = os.path.join(state_dir, f"state-{cwd_hash}.json")
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+        reads = state.get("reads", [])
+    except Exception:
+        return None  # State nicht lesbar -> fail-open
+
+    # Wenn gelesen wurde -> OK
+    if len(reads) > 0:
+        return None
+
+    # Agent-Marker (Agent-Reads passieren im Subprozess, nicht getrackt)
+    if re.search(r'(?i)\b(agent|subagent)\b.*\b(tool|spawn|launch|start)', response):
+        return None
+
+    # Technische Signale zaehlen
+    tech_signals = len(re.findall(
+        r'(```'
+        r'|\.(?:py|js|ts|md|json|yaml|sh|rs|go)\b'
+        r'|(?:def |class |function |import |from \S+ import)'
+        r'|(?:[Ll]ine \d+|Zeile \d+)'
+        r'|(?:[A-Z]:\\|/home/|/usr/|~/\.)'
+        r')',
+        response
+    ))
+
+    if tech_signals < 2:
+        return None  # Nicht genug technische Signale
+
+    return (
+        "GATE-3 READ-CHECK: Deine Antwort enthaelt technische Inhalte "
+        f"({tech_signals} Code-Signale), aber du hast keine Dateien gelesen (0 Reads). "
+        "Lies zuerst die relevanten Dateien mit Read/Grep/Glob, dann antworte."
+    )
+
+
 def main():
     # stdin lesen (Stop-Event JSON)
     try:
@@ -194,7 +222,22 @@ def main():
     except Exception:
         data = {}
 
-    log("Hook triggered")
+    # Session-Isolation: counter files per session
+    session_id = data.get('session_id', '')
+    if session_id:
+        sid_hash = hashlib.md5(session_id.encode()).hexdigest()[:8]
+    else:
+        sid_hash = hashlib.md5(os.getcwd().encode()).hexdigest()[:8]
+
+    counter_file = STATE_DIR / f"stop_check_count_{sid_hash}"
+    plan_gate_counter_file = STATE_DIR / f"plan_gate_count_{sid_hash}"
+    workaround_counter_file = STATE_DIR / f"workaround_count_{sid_hash}"
+    gate3_counter_file = STATE_DIR / f"gate3_read_count_{sid_hash}"
+
+    # Cleanup stale counter files from old sessions
+    cleanup_stale_counters()
+
+    log(f"Hook triggered (session={sid_hash})")
 
     # LOOP-SCHUTZ #1: stop_hook_active Flag
     if data.get("stop_hook_active", False):
@@ -202,12 +245,12 @@ def main():
         sys.exit(0)
 
     # LOOP-SCHUTZ #2: Eigener Zaehler
-    count = get_counter()
+    count = get_counter_value(counter_file)
     log(f"Block count: {count} / {MAX_BLOCKS}")
 
     if count > MAX_BLOCKS:
         log("Max blocks reached -> allowing and resetting counter")
-        reset_counter()
+        reset_counter_value(counter_file)
         sys.exit(0)
 
     # Antwort-Laenge pruefen
@@ -218,26 +261,38 @@ def main():
     # WORKAROUND Check (eigener Zaehler, vor Plan-Gate)
     workaround_msg = check_workaround(response)
     if workaround_msg:
-        wa_count = get_workaround_counter()
+        wa_count = get_counter_value(workaround_counter_file)
         if wa_count <= WORKAROUND_MAX_BLOCKS:
             log(f"BLOCKING - workaround (block {wa_count}/{WORKAROUND_MAX_BLOCKS})")
             print(workaround_msg, file=sys.stderr)
             sys.exit(2)
         else:
             log("Workaround triggered but max blocks reached, resetting")
-            reset_workaround_counter()
+            reset_counter_value(workaround_counter_file)
+
+    # GATE-3 Read Check (eigener Zaehler)
+    gate3_msg = check_gate3_reads(response)
+    if gate3_msg:
+        g3_count = get_counter_value(gate3_counter_file)
+        if g3_count <= GATE3_MAX_BLOCKS:
+            log(f"BLOCKING - gate3 reads (block {g3_count}/{GATE3_MAX_BLOCKS})")
+            print(gate3_msg, file=sys.stderr)
+            sys.exit(2)
+        else:
+            log("Gate3 triggered but max blocks reached, resetting")
+            reset_counter_value(gate3_counter_file)
 
     # PLAN-GATE Check (eigener Zaehler, vor Length-Check)
     plan_gate_msg = check_plan_gate(response)
     if plan_gate_msg:
-        pg_count = get_plan_gate_counter()
+        pg_count = get_counter_value(plan_gate_counter_file)
         if pg_count <= PLAN_GATE_MAX_BLOCKS:
             log(f"BLOCKING - plan-gate (block {pg_count}/{PLAN_GATE_MAX_BLOCKS})")
             print(plan_gate_msg, file=sys.stderr)
             sys.exit(2)
         else:
             log("Plan-gate triggered but max blocks reached, resetting")
-            reset_plan_gate_counter()
+            reset_counter_value(plan_gate_counter_file)
 
     # Research-Coverage Check (unabhaengig von Antwort-Laenge)
     coverage_warning = check_research_coverage()
@@ -261,7 +316,7 @@ def main():
             "1. Habe ich alternative Ansaetze geprueft?\n"
             "2. Was koennte ich uebersehen haben?\n"
             "3. Gibt es Gegenbeweise zu meiner Hauptthese?\n\n"
-            "(Antworte kurz, dann kannst du stoppen)"
+            "(Antworte kurz, dann setze deine aktuelle Aufgabe fort)"
         )
         print(msg, file=sys.stderr)
         sys.exit(2)

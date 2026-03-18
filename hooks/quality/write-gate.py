@@ -69,12 +69,13 @@ def handle_reset():
 
 
 def handle_track_read(hook_input):
-    """PostToolUse:Read/Write: Track file path."""
+    """PostToolUse:Read/Write/Grep/Glob: Track file path or research marker."""
     tool_input = hook_input.get("tool_input", {})
-    file_path = tool_input.get("file_path", "")
+    file_path = tool_input.get("file_path", "") or tool_input.get("path", "")
 
     if not file_path:
-        sys.exit(0)
+        # Grep/Glob ohne expliziten Pfad -> generischer Research-Marker
+        file_path = "__tool_research__"
 
     norm = normalize_path(file_path)
     state = load_state()

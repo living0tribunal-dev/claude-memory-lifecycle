@@ -25,6 +25,7 @@ import sqlite3
 import hashlib
 import sys
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -49,6 +50,10 @@ MAX_REPRIEVES = 3       # Nach N positiven Substance-Checks ohne Cluster → exp
 RECALL_PROMOTE_THRESHOLD = 3  # Nach N Recalls wird Buffer-Entry zu proven
 BRIEFING_MIN_SIM = 0.50       # Minimum Similarity fuer Briefing-Entries
 BRIEFING_MAX_ENTRIES = 10     # Hard Cap fuer Briefing
+CROSS_PROJECT_SIM_THRESHOLD = 0.95  # Embedding-Method effektiv deaktiviert (Auto-Fingerprints erzeugen FP)
+CROSS_PROJECT_KEYWORD_MIN_LEN = 4   # Min Projektname-Laenge fuer Keyword-Match
+CROSS_PROJECT_DOMAIN_KW_MIN_LEN = 3  # Min Laenge fuer Domain-Keyword-Match
+FINGERPRINT_MAX_AGE_DAYS = 7        # Fingerprint-Refresh nach N Tagen
 
 # ─── Lazy-loaded ONNX globals ───────────────────────────────────
 
@@ -193,6 +198,61 @@ def get_db():
         """)
         conn.commit()
 
+    # Cross-project relevance migration (S39)
+    if 'project_fingerprints' not in tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS project_fingerprints (
+                project TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                embedding BLOB,
+                updated_at TEXT NOT NULL,
+                curated INTEGER DEFAULT 0,
+                keywords TEXT
+            )
+        """)
+        conn.commit()
+
+    # Migration: curated + keywords columns (S46)
+    # Runs for pre-S46 DBs where table exists but lacks new columns
+    fp_cols = {row[1] for row in conn.execute("PRAGMA table_info(project_fingerprints)").fetchall()}
+    if fp_cols and 'curated' not in fp_cols:
+        conn.execute("ALTER TABLE project_fingerprints ADD COLUMN curated INTEGER DEFAULT 0")
+        conn.commit()
+    if fp_cols and 'keywords' not in fp_cols:
+        conn.execute("ALTER TABLE project_fingerprints ADD COLUMN keywords TEXT")
+        conn.commit()
+
+    if 'cross_project_relevance' not in tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cross_project_relevance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                entry_project TEXT NOT NULL,
+                relevant_to TEXT NOT NULL,
+                similarity REAL,
+                method TEXT NOT NULL,
+                shown INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+    # Migration: procedure_candidates table (S45)
+    if 'procedure_candidates' not in tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS procedure_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL REFERENCES buffer_entries(id),
+                score INTEGER NOT NULL,
+                detected_at TEXT NOT NULL,
+                status TEXT DEFAULT 'pending'
+                    CHECK(status IN ('pending','accepted','rejected','generated')),
+                procedure_file TEXT,
+                UNIQUE(entry_id)
+            )
+        """)
+        conn.commit()
+
     return conn
 
 # ─── Text utilities ──────────────────────────────────────────────
@@ -218,6 +278,46 @@ def detect_entry_type(text):
     if '#session-save' in first_300:
         return 'session-save'
     return 'insight'
+
+
+def is_error_pattern(text):
+    """Detect if text describes a repeated error pattern using multi-signal scoring.
+    Returns (is_pattern: bool, score: int). Threshold: 3 points minimum.
+    Designed conservative — better to miss a pattern than generate a bad procedure."""
+    score = 0
+
+    # Signal 1: Explicit correction pattern (FALSCH/RICHTIG contrast)
+    if re.search(r'FALSCH', text) and re.search(r'RICHTIG', text):
+        score += 3
+    elif re.search(r'FALSCH|RICHTIG', text):
+        score += 1
+
+    # Signal 2: Multiple session references (repeated across sessions)
+    sessions = set(re.findall(r'\bS\d{2,3}\b', text))
+    if len(sessions) >= 4:
+        score += 3
+    elif len(sessions) >= 2:
+        score += 1
+
+    # Signal 3: Waste/duration language (strong indicator of repeated problem)
+    if re.search(r'\d+\+?\s*Sessions?\s*(verschwendet|lang|ueber|über)', text, re.IGNORECASE):
+        score += 3
+
+    # Signal 4: Prohibition language (NIEMALS, VERBOTEN)
+    if re.search(r'NIEMALS|VERBOTEN', text):
+        score += 2
+
+    # Signal 5: Correction contrast (NICHT...sondern, stattdessen, MUSS statt)
+    if re.search(r'NICHT\s+\w+.*(?:sondern|stattdessen)|MUSS\s+statt', text, re.IGNORECASE):
+        score += 2
+    elif re.search(r'stattdessen|sondern\s', text, re.IGNORECASE):
+        score += 1
+
+    # Signal 6: Failure language (weaker, common in many entries)
+    if re.search(r'gescheitert|fehlgeschlagen|verschwendet', text, re.IGNORECASE):
+        score += 1
+
+    return score >= 3, score
 
 
 def token_set(text):
@@ -299,11 +399,22 @@ def load_model():
 
 
 def embed_texts(texts):
-    """Batch-embed texts. Returns (N, dim) numpy array or None."""
+    """Batch-embed texts. Tries embedding server first, falls back to local ONNX."""
+    import numpy as np
+
+    # Try persistent embedding server first (no 19s model load overhead)
+    try:
+        from embedding_client import get_embeddings_batch, is_server_running
+        if is_server_running():
+            result = get_embeddings_batch(texts)
+            if result is not None:
+                return result
+    except ImportError:
+        pass
+
+    # Fallback: direct ONNX model load
     if not load_model():
         return None
-
-    import numpy as np
 
     tokens = _tokenizer(
         texts, padding=True, truncation=True,
@@ -344,6 +455,208 @@ def blob_to_embedding(blob):
     """Convert raw bytes back to numpy vector."""
     import numpy as np
     return np.frombuffer(blob, dtype=np.float32)
+
+# ─── Cross-Project Relevance (S39) ────────────────────────────────
+
+def strip_session_save_prefix(text):
+    """Strip boilerplate prefix from session-save text for cleaner embeddings."""
+    import re
+    # Remove #project #session-save S[N] (date): prefix
+    text = re.sub(r'^#\S+\s+#session-save\s+\S+\s*\([^)]*\):\s*', '', text)
+    # Remove AUTO-SESSION-SAVE prefix
+    text = re.sub(r'^AUTO-SESSION-SAVE\s+\S+\s*', '', text)
+    return text.strip()
+
+
+def update_project_fingerprints(conn):
+    """Auto-generate fingerprints from latest session-saves per project.
+
+    For each project in the buffer, takes the latest session-save,
+    strips boilerplate, and embeds as project fingerprint.
+    Only updates if no fingerprint exists or it's older than FINGERPRINT_MAX_AGE_DAYS.
+    """
+    import numpy as np
+
+    now = datetime.now()
+
+    # Get existing fingerprints (skip curated)
+    existing = {}
+    curated_projects = set()
+    try:
+        for row in conn.execute("SELECT project, updated_at, curated FROM project_fingerprints").fetchall():
+            existing[row[0]] = row[1]
+            if row[2]:
+                curated_projects.add(row[0])
+    except Exception:
+        return
+
+    # Get distinct projects with session-saves
+    projects = conn.execute("""
+        SELECT DISTINCT project FROM buffer_entries
+        WHERE project IS NOT NULL AND entry_type = 'session-save' AND state != 'expired'
+    """).fetchall()
+
+    to_update = []
+    for (proj,) in projects:
+        if proj in curated_projects:
+            continue  # Curated fingerprints are never auto-updated
+        if proj in existing:
+            age = (now - datetime.fromisoformat(existing[proj])).days
+            if age < FINGERPRINT_MAX_AGE_DAYS:
+                continue
+
+        # Get latest session-save for this project
+        row = conn.execute("""
+            SELECT text FROM buffer_entries
+            WHERE project = ? AND entry_type = 'session-save' AND state != 'expired'
+            ORDER BY id DESC LIMIT 1
+        """, (proj,)).fetchone()
+        if row:
+            stripped = strip_session_save_prefix(row[0])[:500]
+            to_update.append((proj, stripped))
+
+    if not to_update:
+        return
+
+    # Embed all descriptions
+    texts = [desc for _, desc in to_update]
+    embeddings = embed_texts(texts)
+    if embeddings is None:
+        return
+
+    for (proj, desc), emb in zip(to_update, embeddings):
+        conn.execute("""
+            INSERT INTO project_fingerprints (project, description, embedding, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project) DO UPDATE SET
+                description = excluded.description,
+                embedding = excluded.embedding,
+                updated_at = excluded.updated_at
+        """, (proj, desc, embedding_to_blob(emb), now.isoformat()))
+
+    conn.commit()
+    print(f"Fingerprints aktualisiert: {', '.join(p for p, _ in to_update)}")
+
+
+def check_cross_project_relevance(conn, new_ids, new_embeddings, pending_projects):
+    """Check new entries against other projects' fingerprints + keyword match.
+
+    Two methods:
+    1. Embedding: new entry vs fingerprint of OTHER project (sim >= threshold)
+    2. Keyword: project name appears in entry text (deterministic)
+
+    Results stored in cross_project_relevance table for awareness injection.
+    """
+    import numpy as np
+
+    # Load fingerprints
+    fingerprints = {}
+    try:
+        for row in conn.execute(
+            "SELECT project, embedding FROM project_fingerprints WHERE embedding IS NOT NULL"
+        ).fetchall():
+            vec = blob_to_embedding(row[1]).copy()
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            fingerprints[row[0]] = vec
+    except Exception:
+        return
+
+    if not fingerprints:
+        return
+
+    # Get known project names for keyword check
+    all_projects = set(fingerprints.keys())
+
+    # Load curated domain keywords per project
+    project_domain_keywords = {}
+    try:
+        for row in conn.execute(
+            "SELECT project, keywords FROM project_fingerprints WHERE keywords IS NOT NULL AND keywords != ''"
+        ).fetchall():
+            kws = [kw.strip().lower() for kw in row[1].split(",") if kw.strip() and len(kw.strip()) >= CROSS_PROJECT_DOMAIN_KW_MIN_LEN]
+            if kws:
+                project_domain_keywords[row[0]] = kws
+    except Exception:
+        pass
+
+    now = datetime.now().isoformat()
+    new_matches = 0
+
+    for entry_id, embedding in zip(new_ids, new_embeddings):
+        entry_project = pending_projects.get(entry_id)
+        if not entry_project:
+            continue
+
+        # Get entry text for keyword check
+        row = conn.execute(
+            "SELECT text FROM buffer_entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        entry_text = row[0].lower() if row else ""
+
+        matched_projects = set()
+
+        # Method 1: Embedding vs fingerprints of OTHER projects (threshold 0.95 = near-disabled)
+        for fp_project, fp_vec in fingerprints.items():
+            if fp_project == entry_project:
+                continue
+            sim = float(np.dot(embedding, fp_vec))
+            if sim >= CROSS_PROJECT_SIM_THRESHOLD:
+                matched_projects.add(fp_project)
+                try:
+                    conn.execute("""
+                        INSERT INTO cross_project_relevance
+                        (entry_id, entry_project, relevant_to, similarity, method, created_at)
+                        VALUES (?, ?, ?, ?, 'embedding', ?)
+                    """, (entry_id, entry_project, fp_project, round(sim, 3), now))
+                    new_matches += 1
+                except sqlite3.IntegrityError:
+                    pass
+
+        # Method 2a: Domain keyword match (curated keywords of OTHER project in entry text)
+        for other_project, kws in project_domain_keywords.items():
+            if other_project == entry_project:
+                continue
+            if other_project in matched_projects:
+                continue
+            for kw in kws:
+                if kw in entry_text:
+                    matched_projects.add(other_project)
+                    try:
+                        conn.execute("""
+                            INSERT INTO cross_project_relevance
+                            (entry_id, entry_project, relevant_to, similarity, method, created_at)
+                            VALUES (?, ?, ?, NULL, 'domain-keyword', ?)
+                        """, (entry_id, entry_project, other_project, now))
+                        new_matches += 1
+                    except sqlite3.IntegrityError:
+                        pass
+                    break  # One keyword match per project is enough
+
+        # Method 2b: Project name match (original — project name in text)
+        for other_project in all_projects:
+            if other_project == entry_project:
+                continue
+            if other_project in matched_projects:
+                continue
+            if len(other_project) < CROSS_PROJECT_KEYWORD_MIN_LEN:
+                continue
+            if other_project.lower() in entry_text:
+                try:
+                    conn.execute("""
+                        INSERT INTO cross_project_relevance
+                        (entry_id, entry_project, relevant_to, similarity, method, created_at)
+                        VALUES (?, ?, ?, NULL, 'keyword', ?)
+                    """, (entry_id, entry_project, other_project, now))
+                    new_matches += 1
+                except sqlite3.IntegrityError:
+                    pass
+
+    if new_matches:
+        conn.commit()
+        print(f"Cross-Projekt-Relevanz: {new_matches} neue Matches.")
+
 
 # ─── Gemini Resilient Wrapper ─────────────────────────────────────
 
@@ -551,9 +864,17 @@ def cmd_embed_pending(args):
                         pass
 
     conn.commit()
-    conn.close()
 
     print(f"{len(ids)} embedded, {new_connections} Connections.")
+
+    # Cross-project relevance check (S39)
+    try:
+        update_project_fingerprints(conn)
+        check_cross_project_relevance(conn, ids, embeddings, pending_projects)
+    except Exception as e:
+        print(f"Cross-Projekt-Check Fehler: {e}", file=sys.stderr)
+
+    conn.close()
 
 
 def cmd_search(args):
@@ -1310,12 +1631,92 @@ def cmd_consolidate(args):
             print(f"     {preview}")
         if len(results) > 1:
             print(f"  -> {len(results)} Eintraege aus Multi-Topic-Split")
+
+        # Procedure candidate detection (S45)
+        for new_id in new_ids:
+            row = conn.execute("SELECT text FROM buffer_entries WHERE id = ?", (new_id,)).fetchone()
+            if row:
+                is_pattern, pattern_score = is_error_pattern(row[0])
+                if is_pattern:
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO procedure_candidates (entry_id, score, detected_at) "
+                            "VALUES (?, ?, ?)",
+                            (new_id, pattern_score, datetime.now().isoformat())
+                        )
+                        print(f"  -> FEHLER-MUSTER erkannt (Score {pattern_score}) -> procedure_candidates [{new_id}]")
+                    except Exception:
+                        pass
+
         print()
 
     conn.close()
 
     print(f"--- Zusammenfassung ---")
     print(f"Konsolidiert: {consolidated_count} Cluster")
+
+
+def cmd_suggest_procedures(args):
+    """Scan proven/buffer entries for error patterns, show candidates."""
+    scan_all = '--scan-all' in args
+    project_filter = None
+    for i, a in enumerate(args):
+        if a == '--project' and i + 1 < len(args):
+            project_filter = args[i + 1]
+
+    conn = get_db()
+
+    if scan_all:
+        # Scan all non-expired entries
+        query = "SELECT id, text, state, project FROM buffer_entries WHERE state != 'expired'"
+        params = []
+        if project_filter:
+            query += " AND (project = ? OR project IS NULL)"
+            params.append(project_filter)
+        rows = conn.execute(query, params).fetchall()
+
+        new_candidates = 0
+        for eid, text, state, project in rows:
+            is_pattern, score = is_error_pattern(text)
+            if is_pattern:
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO procedure_candidates (entry_id, score, detected_at) "
+                        "VALUES (?, ?, ?)",
+                        (eid, score, datetime.now().isoformat())
+                    )
+                    new_candidates += 1
+                except Exception:
+                    pass
+        conn.commit()
+        print(f"Scan: {len(rows)} Entries geprueft, {new_candidates} neue Kandidaten\n")
+
+    # Show all candidates
+    candidates = conn.execute("""
+        SELECT pc.id, pc.entry_id, pc.score, pc.status, pc.detected_at,
+               be.text, be.state, be.project
+        FROM procedure_candidates pc
+        JOIN buffer_entries be ON pc.entry_id = be.id
+        ORDER BY pc.score DESC, pc.detected_at DESC
+    """).fetchall()
+
+    if not candidates:
+        print("Keine Procedure-Kandidaten gefunden.")
+        if not scan_all:
+            print("Tipp: --scan-all um alle Entries zu scannen")
+        conn.close()
+        return
+
+    print(f"=== PROCEDURE-KANDIDATEN ({len(candidates)}) ===\n")
+    for cid, eid, score, status, detected, text, state, project in candidates:
+        preview = text[:200].replace('\n', ' ')
+        proj_str = f" [{project}]" if project else ""
+        print(f"  [{cid}] Entry #{eid} (Score {score}, {status}){proj_str}")
+        print(f"      State: {state} | Detected: {detected[:10]}")
+        print(f"      {preview}")
+        print()
+
+    conn.close()
 
 
 # ─── Phase 3: Routing + Conflict-Check + Write ───────────────────
@@ -2277,6 +2678,128 @@ def cmd_age(args):
 
 # ─── Main ────────────────────────────────────────────────────────
 
+def cmd_cross_project(args):
+    """Show cross-project relevance matches."""
+    conn = get_db()
+
+    # Parse --project filter
+    project_filter = None
+    if '--project' in args:
+        idx = args.index('--project')
+        if idx + 1 < len(args):
+            project_filter = args[idx + 1]
+
+    show_all = '--all' in args
+
+    query = """
+        SELECT cr.id, cr.entry_id, cr.entry_project, cr.relevant_to,
+               cr.similarity, cr.method, cr.shown, cr.created_at,
+               SUBSTR(b.text, 1, 150) as preview
+        FROM cross_project_relevance cr
+        JOIN buffer_entries b ON cr.entry_id = b.id
+    """
+    params = []
+    conditions = []
+
+    if project_filter:
+        conditions.append("(cr.entry_project = ? OR cr.relevant_to = ?)")
+        params.extend([project_filter, project_filter])
+
+    if not show_all:
+        conditions.append("cr.shown = 0")
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY cr.created_at DESC LIMIT 20"
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    if not rows:
+        print("Keine Cross-Projekt-Relevanz gefunden.")
+        return
+
+    print(f"=== Cross-Projekt-Relevanz {'(alle)' if show_all else '(ungesehen)'} ===\n")
+    for cid, eid, eproj, rel_to, sim, method, shown, created, preview in rows:
+        sim_str = f"sim={sim:.3f}" if sim else "keyword"
+        shown_str = " [shown]" if shown else ""
+        preview_clean = preview.replace('\n', ' ')
+        print(f"  [{cid}] Entry {eid} ({eproj}) → relevant fuer {rel_to} ({method}: {sim_str}){shown_str}")
+        print(f"      {preview_clean}")
+        print()
+
+
+def cmd_update_fingerprints(args):
+    """Manually update project fingerprints.
+
+    Usage:
+      update-fingerprints                           # Auto-update non-curated fingerprints
+      update-fingerprints --project NAME --keywords "kw1, kw2, kw3"  # Set curated keywords
+      update-fingerprints --project NAME --clear     # Remove curated keywords (re-enable auto)
+    """
+    conn = get_db()
+
+    # Parse --project and --keywords
+    project = None
+    keywords = None
+    clear = '--clear' in args
+
+    if '--project' in args:
+        idx = args.index('--project')
+        if idx + 1 < len(args):
+            project = args[idx + 1]
+
+    if '--keywords' in args:
+        idx = args.index('--keywords')
+        if idx + 1 < len(args):
+            keywords = args[idx + 1]
+
+    # Set curated keywords for a specific project
+    if project and keywords:
+        now = datetime.now().isoformat()
+        conn.execute("""
+            INSERT INTO project_fingerprints (project, description, updated_at, curated, keywords)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(project) DO UPDATE SET
+                keywords = excluded.keywords,
+                curated = 1,
+                updated_at = excluded.updated_at
+        """, (project, f"Curated: {keywords[:100]}", now, keywords))
+        conn.commit()
+        print(f"Curated keywords fuer '{project}': {keywords}")
+        conn.close()
+        return
+
+    # Clear curated status
+    if project and clear:
+        conn.execute("""
+            UPDATE project_fingerprints SET curated = 0, keywords = NULL WHERE project = ?
+        """, (project,))
+        conn.commit()
+        print(f"Curated status fuer '{project}' entfernt. Auto-Update wieder aktiv.")
+        conn.close()
+        return
+
+    # Default: auto-update non-curated fingerprints
+    update_project_fingerprints(conn)
+
+    # Show current fingerprints
+    rows = conn.execute(
+        "SELECT project, SUBSTR(description, 1, 80), updated_at, curated, keywords FROM project_fingerprints"
+    ).fetchall()
+    conn.close()
+
+    if rows:
+        print("Aktuelle Fingerprints:")
+        for proj, desc, updated, curated, kws in rows:
+            curated_str = " [CURATED]" if curated else ""
+            kws_str = f"\n    Keywords: {kws}" if kws else ""
+            print(f"  {proj}{curated_str}: {desc}... ({updated[:10]}){kws_str}")
+    else:
+        print("Keine Fingerprints vorhanden. Erst session-saves + embed-pending ausfuehren.")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -2305,6 +2828,9 @@ def main():
         'diamond-check': cmd_diamond_check,
         'age': cmd_age,
         'migrate': cmd_migrate,
+        'cross-project': cmd_cross_project,
+        'update-fingerprints': cmd_update_fingerprints,
+        'suggest-procedures': cmd_suggest_procedures,
     }
 
     if command in commands:
