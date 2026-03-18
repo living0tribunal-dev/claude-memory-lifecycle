@@ -519,8 +519,16 @@ def awareness_mode():
         n_files = len(all_files)
         # Recently modified (last 1h)
         one_hour_ago = _time.time() - 3600
-        recent = sum(1 for f in all_files if f.stat().st_mtime > one_hour_ago)
-        recent_str = f", {recent} kuerzlich geaendert" if recent > 0 else ""
+        recent_files = sorted(
+            [f for f in all_files if f.stat().st_mtime > one_hour_ago],
+            key=lambda f: f.stat().st_mtime, reverse=True
+        )
+        recent = len(recent_files)
+        if recent > 0:
+            recent_names = ", ".join(f.name[:30] for f in recent_files[:3])
+            recent_str = f", {recent} kuerzlich geaendert ({recent_names})"
+        else:
+            recent_str = ""
         messages.append(f"GATE-3: {n_files} Dateien in CWD{recent_str}. {reads_count} in diesem Prompt gelesen.")
     except Exception:
         messages.append("GATE-3: Erst LESEN (Read/Grep), dann antworten.")

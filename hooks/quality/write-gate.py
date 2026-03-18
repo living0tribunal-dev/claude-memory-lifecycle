@@ -16,6 +16,7 @@ import json
 import os
 import time
 import hashlib
+import re
 
 # Schwellen (nur fuer neue Dateien via Write)
 LARGE_WRITE_THRESHOLD = 5000   # Zeichen — darunter kein Check
@@ -107,24 +108,35 @@ def handle_check_write(hook_input):
     is_new_file = (tool_name == "Write" and not os.path.exists(file_path))
 
     if is_new_file:
-        # New file: apply quantity check (need enough research before large writes)
-        content = tool_input.get("content", "")
-        if len(content) < LARGE_WRITE_THRESHOLD:
-            sys.exit(0)  # Small new files pass
-        if len(tracked) >= MIN_READS_FOR_LARGE_WRITE:
-            sys.exit(0)  # Enough research done
-        output = {
-            "hookSpecificOutput": {
-                "message": (
-                    f"GATE-3: Neue Datei mit {len(content)} Zeichen, "
-                    f"aber nur {len(tracked)} Datei(en) gelesen. "
-                    f"Minimum: {MIN_READS_FOR_LARGE_WRITE} Reads vor einem grossen Write. "
-                    f"Lies zuerst die relevanten Quellen."
-                )
+        # B6 fix: ANY new file needs at least 1 tracked read/search
+        if len(tracked) < 1:
+            output = {
+                "hookSpecificOutput": {
+                    "message": (
+                        f"GATE-3: Neue Datei '{os.path.basename(file_path)}' "
+                        f"aber 0 Dateien gelesen/gesucht. "
+                        f"Lies zuerst mindestens eine relevante Quelle."
+                    )
+                }
             }
-        }
-        print(json.dumps(output))
-        sys.exit(2)
+            print(json.dumps(output))
+            sys.exit(2)
+        # Large new files need more research
+        content = tool_input.get("content", "")
+        if len(content) >= LARGE_WRITE_THRESHOLD and len(tracked) < MIN_READS_FOR_LARGE_WRITE:
+            output = {
+                "hookSpecificOutput": {
+                    "message": (
+                        f"GATE-3: Neue Datei mit {len(content)} Zeichen, "
+                        f"aber nur {len(tracked)} Datei(en) gelesen. "
+                        f"Minimum: {MIN_READS_FOR_LARGE_WRITE} Reads vor einem grossen Write. "
+                        f"Lies zuerst die relevanten Quellen."
+                    )
+                }
+            }
+            print(json.dumps(output))
+            sys.exit(2)
+        sys.exit(0)
     else:
         # Existing file: MUST have been read/written this prompt
         output = {
@@ -140,6 +152,77 @@ def handle_check_write(hook_input):
         sys.exit(2)
 
 
+def extract_bash_write_targets(command):
+    """Extract file paths that a bash command would write to."""
+    targets = []
+    SKIP_TARGETS = {'/dev/null', '/dev/stderr', '/dev/stdout', 'NUL', 'nul'}
+
+    # Pattern 1: > or >> redirect (not 2>, >&, |>)
+    for m in re.finditer(r'(?<![2&|])>{1,2}\s*([^\s;|&>]+)', command):
+        t = m.group(1).strip("'\"")
+        if t and t not in SKIP_TARGETS and not t.startswith('&'):
+            targets.append(t)
+
+    # Pattern 2: tee (with optional flags like -a)
+    for m in re.finditer(r'\btee\s+(?:-\w+\s+)*([^\s;|&]+)', command):
+        t = m.group(1).strip("'\"")
+        if t and not t.startswith('-') and t not in SKIP_TARGETS:
+            targets.append(t)
+
+    # Pattern 3: sed -i (in-place edit) — files after expression
+    sed_match = re.search(
+        r"""\bsed\s+-i\S*\s+(?:'[^']*'|"[^"]*")\s+(.+?)(?:\s*[;|&]|$)""",
+        command
+    )
+    if sed_match:
+        for token in sed_match.group(1).split():
+            t = token.strip("'\"")
+            if t and not t.startswith('-'):
+                targets.append(t)
+
+    return targets
+
+
+def handle_check_bash(hook_input):
+    """PreToolUse:Bash: Block bash commands that write to existing unread files."""
+    tool_input = hook_input.get("tool_input", {})
+    command = tool_input.get("command", "")
+
+    if not command:
+        sys.exit(0)
+
+    targets = extract_bash_write_targets(command)
+    if not targets:
+        sys.exit(0)
+
+    state = load_state()
+    tracked = [normalize_path(p) for p in state.get("reads", [])]
+
+    for target in targets:
+        # Resolve relative paths against CWD
+        if os.path.isabs(target):
+            target_path = target
+        else:
+            target_path = os.path.join(os.getcwd(), target)
+        norm = normalize_path(target_path)
+
+        # Only block if file EXISTS and NOT in tracked reads
+        if os.path.exists(target_path) and norm not in tracked:
+            output = {
+                "hookSpecificOutput": {
+                    "message": (
+                        f"GATE-3: Bash-Befehl schreibt in '{os.path.basename(target_path)}' "
+                        f"aber diese Datei wurde nicht gelesen. "
+                        f"Erst Read('{target_path}'), dann Bash."
+                    )
+                }
+            }
+            print(json.dumps(output))
+            sys.exit(2)
+
+    sys.exit(0)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     hook_input = get_hook_input()
@@ -150,5 +233,7 @@ if __name__ == "__main__":
         handle_track_read(hook_input)
     elif mode == "check-write":
         handle_check_write(hook_input)
+    elif mode == "check-bash":
+        handle_check_bash(hook_input)
     else:
         sys.exit(0)

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_FILE = Path.home() / ".claude" / "hooks" / "hook-debug.log"
-MUTATION_TOOLS = {"Write", "Edit", "Bash", "NotebookEdit"}
+MUTATION_TOOLS = {"Write", "Edit", "NotebookEdit"}
 
 def main():
     # stdin parsen
