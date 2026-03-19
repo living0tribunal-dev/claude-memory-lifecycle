@@ -268,6 +268,10 @@ def execute_check(procedure, cwd):
     path_pattern = check.get("path", "")
     expect = check.get("expect", "present")
 
+    # Reminder type: always inject when keywords match (no check needed)
+    if check_type == "reminder":
+        return False, "reminder"
+
     if not path_pattern:
         return True, ""
 
@@ -346,11 +350,16 @@ def main():
         if not passed:
             name = proc.get("name", "Unknown")
             body = proc.get("body", "")
-            injection = f"PROCEDURAL MEMORY [{name}]: {body}"
-            if detail:
-                injection += f"\n  Check-Detail: {detail}"
-            injections.append((keyword_hits, injection))
-            log(f"TRIGGERED: {name} ({keyword_hits} keywords, check failed: {detail})")
+            if detail == "reminder":
+                injection = f"BEKANNTE STANDARD-EINSTELLUNG [{name}]: {body}\n(Standard-Einstellung. Weicht bei expliziter User-Anweisung in dieser Session.)"
+            else:
+                injection = f"PROCEDURAL MEMORY [{name}]: {body}"
+                if detail:
+                    injection += f"\n  Check-Detail: {detail}"
+            # Check-failures rank above reminders (actual problem > preventive reminder)
+            priority = keyword_hits + (100 if detail != "reminder" else 0)
+            injections.append((priority, injection))
+            log(f"TRIGGERED: {name} ({keyword_hits} keywords, {'reminder' if detail == 'reminder' else 'check failed: ' + detail})")
         else:
             log(f"PASSED: {proc.get('name', '?')} ({keyword_hits} keywords, check OK)")
 

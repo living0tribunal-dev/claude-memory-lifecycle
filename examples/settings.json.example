@@ -3,6 +3,17 @@
     "GEMINI_API_KEY": "YOUR_GEMINI_API_KEY_HERE"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/scripts/embedding-server.py --start",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
@@ -114,13 +125,22 @@
         ]
       },
       {
-        "matcher": "Agent",
+        "matcher": "Glob",
         "hooks": [
           {
             "type": "command",
-            "command": "python ~/.claude/hooks/agent-results-persist.py",
-            "timeout": 5000,
-            "async": true
+            "command": "python ~/.claude/hooks/write-gate.py track-read",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/write-gate.py track-read",
+            "timeout": 3000
           }
         ]
       }
@@ -152,6 +172,45 @@
             "type": "command",
             "command": "python ~/.claude/hooks/write-gate.py reset",
             "timeout": 3000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/procedural-memory.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/agent-results-persist.py",
+            "timeout": 10000,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/auto-session-save.py",
+            "timeout": 60000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/scripts/memory-buffer.py age",
+            "timeout": 30000
+          },
+          {
+            "type": "command",
+            "command": "python ~/.claude/scripts/memory-buffer.py consolidate",
+            "timeout": 120000,
+            "async": true
           }
         ]
       }

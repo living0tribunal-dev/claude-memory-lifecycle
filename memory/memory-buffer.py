@@ -403,16 +403,29 @@ def embed_texts(texts):
     import numpy as np
 
     # Try persistent embedding server first (no 19s model load overhead)
+    server_available = False
     try:
         from embedding_client import get_embeddings_batch, is_server_running
         if is_server_running():
+            server_available = True
             result = get_embeddings_batch(texts)
             if result is not None:
                 return result
+            # Server running but request failed — retry once after brief pause
+            import time
+            time.sleep(0.5)
+            result = get_embeddings_batch(texts)
+            if result is not None:
+                return result
+            print("WARNUNG: Embedding-Server laeuft aber antwortet nicht nach Retry", file=sys.stderr)
     except ImportError:
         pass
 
-    # Fallback: direct ONNX model load
+    # Skip ONNX fallback if server is running (double memory load = bad allocation)
+    if server_available:
+        return None
+
+    # Fallback: direct ONNX model load (only when server not running at all)
     if not load_model():
         return None
 

@@ -11,7 +11,7 @@ ZWECK:
 - RESUME_PROMPT.md generieren falls Projekt aktiv
 - Context-Watchdog Counter resetten
 
-AUFRUF: Von PreCompact Hook in settings.json
+AUFRUF: Von PreCompact und SessionEnd Hook in settings.json
 """
 
 import sys
@@ -34,8 +34,74 @@ CLAUDE_MEM_SCRIPT = HOME / '.claude' / 'scripts' / 'claude-mem.py'
 MEMORY_BUFFER_SCRIPT = HOME / '.claude' / 'scripts' / 'memory-buffer.py'
 WATCHDOG_STATE_FILE = CLAUDE_DIR / 'state' / 'context-watchdog.json'
 
+# Gemini Config
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+MIN_MESSAGES_FOR_SUMMARY = 5
+MAX_MESSAGES_FOR_PROMPT = 20
+MAX_PROMPT_CHARS = 5000
+
 # Logging
 LOG_FILE = CLAUDE_DIR / 'hooks' / 'hook-debug.log'
+
+
+def summarize_with_gemini(user_messages: list, files_created: list, main_task: str) -> str:
+    """Call Gemini to generate a semantic session summary. Returns empty string on failure."""
+    if len(user_messages) < MIN_MESSAGES_FOR_SUMMARY:
+        return ''
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return ''
+
+    api_key = os.environ.get('GEMINI_API_KEY_ROUTING') or os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return ''
+
+    # Build prompt with truncated user messages
+    msgs_text = '\n'.join(
+        f"- {m[:200]}" for m in user_messages[-MAX_MESSAGES_FOR_PROMPT:]
+        if not m.startswith('<') and len(m.strip()) > 10
+    )
+    if len(msgs_text) > MAX_PROMPT_CHARS:
+        msgs_text = msgs_text[:MAX_PROMPT_CHARS] + '\n... (truncated)'
+
+    files_text = '\n'.join(f"- {f}" for f in files_created[:15]) if files_created else '- None'
+
+    prompt = f"""Fasse diese Claude Code Session zusammen. Extrahiere:
+1. Hauptaufgabe (1 Satz)
+2. Wichtigste Entscheidungen (max 3, nur wenn vorhanden)
+3. Neue Erkenntnisse/Learnings (max 3, nur wenn vorhanden)
+4. Fehler die gemacht wurden (nur wenn vorhanden)
+
+Max 200 Woerter. Nur Fakten, keine Empfehlungen. Deutsch.
+
+HAUPTAUFGABE: {main_task}
+
+USER-MESSAGES:
+{msgs_text}
+
+GEAENDERTE DATEIEN:
+{files_text}"""
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="text/plain"
+            )
+        )
+        summary = response.text.strip() if response.text else ''
+        if summary and len(summary) > 50:
+            return summary
+    except Exception as e:
+        log(f"Gemini summarize failed: {e}")
+
+    return ''
+
 
 def log(msg: str):
     """Write to hook debug log"""
@@ -215,11 +281,25 @@ def analyze_session(transcript: dict) -> dict:
         'last_user_messages': last_messages,
     }
 
-def save_to_claude_mem(analysis: dict, date_tag: str):
+def save_to_claude_mem(analysis: dict, date_tag: str, gemini_summary: str = ''):
     """Save analysis to claude-mem"""
     try:
         # Build structured summary
-        summary = f"""AUTO-SESSION-SAVE {date_tag}
+        if gemini_summary:
+            summary = f"""AUTO-SESSION-SAVE {date_tag}
+
+MAIN TASK: {analysis['main_task']}
+
+SUMMARY (Gemini):
+{gemini_summary}
+
+SESSION STATISTICS:
+- User Messages: {analysis['user_message_count']}
+- Tool Calls: {analysis['tool_call_count']}
+- Files Created: {analysis['files_created_count']}
+- Commands Run: {analysis['commands_count']}"""
+        else:
+            summary = f"""AUTO-SESSION-SAVE {date_tag}
 
 MAIN TASK: {analysis['main_task']}
 
@@ -505,9 +585,22 @@ def main():
     analysis = analyze_session(transcript)
     log(f"Analysis complete: {analysis['files_created_count']} files, {analysis['tool_call_count']} tool calls, {analysis['user_message_count']} user messages")
 
+    # 2b. Gemini semantic summary
+    gemini_summary = ''
+    if analysis['user_message_count'] >= MIN_MESSAGES_FOR_SUMMARY:
+        log("Step 2b: Generating Gemini summary...")
+        user_messages = extract_user_messages(transcript['events'])
+        gemini_summary = summarize_with_gemini(
+            user_messages, analysis['files_created'], analysis['main_task']
+        )
+        if gemini_summary:
+            log(f"Gemini summary: {len(gemini_summary)} chars")
+        else:
+            log("Gemini summary: skipped or failed")
+
     # 3. Save to claude-mem
     log("Step 3: Saving to claude-mem...")
-    mem_success = save_to_claude_mem(analysis, date_tag)
+    mem_success = save_to_claude_mem(analysis, date_tag, gemini_summary)
 
     # 4. Backup Chroma DB
     log("Step 4: Backing up Chroma database...")

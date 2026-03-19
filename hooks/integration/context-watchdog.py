@@ -93,7 +93,7 @@ def main():
 
         output = {
             "hookSpecificOutput": {
-                "additionalContext": f"CONTEXT WATCHDOG: {count} User-Messages in dieser Session{compact_info}. Auto-compact triggert bei ~90%. /session-save ausfuehren um Kontext zu sichern."
+                "additionalContext": f"CONTEXT WATCHDOG: {count} User-Messages in dieser Session{compact_info}. Bei 1M Context laeuft die Session lange ohne Compact. /session-save ausfuehren um semantischen Kontext zu sichern."
             }
         }
         print(json.dumps(output))

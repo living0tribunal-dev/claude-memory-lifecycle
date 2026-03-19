@@ -28,8 +28,8 @@ STATE_DIR = Path.home() / ".claude" / "state"
 LOG_DIR = Path.home() / ".claude" / "logs"
 PLAN_GATE_MAX_BLOCKS = 1
 WORKAROUND_MAX_BLOCKS = 1
-GATE3_MAX_BLOCKS = 2
-GATE3_MIN_LENGTH = 500
+GATE3_MAX_BLOCKS = 3
+GATE3_MIN_LENGTH = 150
 TRACKER_FILE = os.path.join(os.environ.get("TEMP", "/tmp"), "claude-research-tracker.json")
 COUNTER_PREFIXES = ("stop_check_count_", "plan_gate_count_", "workaround_count_", "gate3_read_count_")
 
@@ -183,14 +183,17 @@ def check_gate3_reads(response):
             state = json.load(f)
         reads = state.get("reads", [])
     except Exception:
-        return None  # State nicht lesbar -> fail-open
+        reads = []  # State nicht lesbar -> fail-closed (annehme 0 Reads)
 
     # Wenn gelesen wurde -> OK
     if len(reads) > 0:
         return None
 
     # Agent-Marker (Agent-Reads passieren im Subprozess, nicht getrackt)
-    if re.search(r'(?i)\b(agent|subagent)\b.*\b(tool|spawn|launch|start)', response):
+    # Verschaerft S49: nur tatsaechliche Agent-Spawn-Formulierungen, nicht zufaellige Wort-Kombis
+    if re.search(r'(?i)(?:spawn|launch|start)(?:ed|ing|e)?\s+(?:a |an |the |den |einen )?(?:\w+\s+)?agents?\b', response):
+        return None
+    if re.search(r'(?i)\bAgent\s+tool\b.*\b(?:launch|spawn|start)', response):
         return None
 
     # Technische Signale zaehlen
@@ -204,7 +207,7 @@ def check_gate3_reads(response):
         response
     ))
 
-    if tech_signals < 2:
+    if tech_signals < 1:
         return None  # Nicht genug technische Signale
 
     return (

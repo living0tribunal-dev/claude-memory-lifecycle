@@ -86,35 +86,50 @@ def main():
     except Exception:
         return
 
-    tool_name = input_data.get('tool_name', '')
-    if tool_name != 'Agent':
-        return
+    hook_event = input_data.get('hook_event_name', '')
 
-    # Get result
-    tool_result = input_data.get('tool_result', '')
-    if isinstance(tool_result, dict):
-        tool_result = json.dumps(tool_result, ensure_ascii=False, indent=2)
-    tool_result = str(tool_result)
-
-    if len(tool_result) < MIN_RESULT_LENGTH:
-        log(f"Agent result too short ({len(tool_result)} chars). Input keys: {list(input_data.keys())}")
-        # Fallback: read from transcript
-        transcript_path = input_data.get('transcript_path', '')
-        tool_use_id = input_data.get('tool_use_id', '')
-        if transcript_path and tool_use_id:
-            tool_result = read_result_from_transcript(transcript_path, tool_use_id)
-            if len(tool_result) < MIN_RESULT_LENGTH:
-                log(f"Transcript fallback also short ({len(tool_result)} chars), skipping")
-                return
-            log(f"Got result from transcript fallback ({len(tool_result)} chars)")
-        else:
-            log(f"No transcript_path or tool_use_id for fallback, skipping")
+    # SubagentStop: dedicated event with direct access to result
+    if hook_event == 'SubagentStop':
+        # Prevent infinite loops
+        if input_data.get('stop_hook_active'):
             return
 
-    # Get prompt for context
-    tool_input = input_data.get('tool_input', {})
-    prompt = tool_input.get('prompt', 'No prompt available')
-    prompt_summary = prompt[:500] + '...' if len(prompt) > 500 else prompt
+        tool_result = input_data.get('last_assistant_message', '')
+        if len(str(tool_result)) < MIN_RESULT_LENGTH:
+            log(f"SubagentStop result too short ({len(str(tool_result))} chars), skipping")
+            return
+
+        agent_type = input_data.get('agent_type', 'unknown')
+        agent_id = input_data.get('agent_id', '')
+        prompt_summary = f"SubagentStop: type={agent_type}, id={agent_id}"
+
+    # PostToolUse:Agent fallback (legacy path)
+    elif input_data.get('tool_name') == 'Agent':
+        tool_result = input_data.get('tool_result', '')
+        if isinstance(tool_result, dict):
+            tool_result = json.dumps(tool_result, ensure_ascii=False, indent=2)
+        tool_result = str(tool_result)
+
+        if len(tool_result) < MIN_RESULT_LENGTH:
+            log(f"Agent result too short ({len(tool_result)} chars). Input keys: {list(input_data.keys())}")
+            transcript_path = input_data.get('transcript_path', '')
+            tool_use_id = input_data.get('tool_use_id', '')
+            if transcript_path and tool_use_id:
+                tool_result = read_result_from_transcript(transcript_path, tool_use_id)
+                if len(tool_result) < MIN_RESULT_LENGTH:
+                    log(f"Transcript fallback also short ({len(tool_result)} chars), skipping")
+                    return
+                log(f"Got result from transcript fallback ({len(tool_result)} chars)")
+            else:
+                log(f"No transcript_path or tool_use_id for fallback, skipping")
+                return
+
+        tool_input = input_data.get('tool_input', {})
+        prompt_summary = tool_input.get('prompt', 'No prompt available')
+        prompt_summary = prompt_summary[:500] + '...' if len(prompt_summary) > 500 else prompt_summary
+
+    else:
+        return
 
     # Detect output directory
     cwd = input_data.get('cwd', os.getcwd())
