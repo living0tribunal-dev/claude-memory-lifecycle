@@ -99,62 +99,50 @@ def is_sensitive_file(filepath: str) -> tuple[bool, str]:
 
     return False, ""
 
+
+def _block_msg(*lines):
+    """Build multi-line block message."""
+    return chr(10).join(lines)
+
+
 def main():
     """Hauptfunktion - liest stdin JSON und prüft Dateipfade."""
-    try:
-        # Input von Claude Code lesen
-        input_data = sys.stdin.read()
+    from platform_adapter import HookContext
+    ctx = HookContext("PreToolUse")
 
-        if not input_data.strip():
-            # Kein Input = durchlassen
-            sys.exit(0)
-
-        data = json.loads(input_data)
-
-        # Tool und Parameter extrahieren (unterstützt tool_name UND toolName)
-        tool_name = data.get('tool_name') or data.get('toolName', '')
-        tool_input = data.get('tool_input') or data.get('toolInput', {})
-
-        # Dateipfad je nach Tool extrahieren
-        filepath = None
-        if tool_name in ('Read', 'Edit', 'Write'):
-            filepath = tool_input.get('file_path', '')
-        elif tool_name == 'Bash':
-            # Bei Bash: Kommando auf Dateipfade prüfen
-            command = tool_input.get('command', '')
-            # Einfache Heuristik: Prüfe ob sensitive Dateinamen im Kommando
-            for sensitive in SENSITIVE_FILENAMES:
-                if sensitive in command.lower():
-                    print(f"BLOCKED: Bash-Kommando referenziert sensitive Datei '{sensitive}'", file=sys.stderr)
-                    print(f"Grund: Diese Datei könnte Secrets enthalten.", file=sys.stderr)
-                    print(f"Lösung: Verwende .env.example als Template oder frage den User.", file=sys.stderr)
-                    sys.exit(2)
-            sys.exit(0)
-
-        if not filepath:
-            sys.exit(0)
-
-        # Prüfen
-        is_sensitive, reason = is_sensitive_file(filepath)
-
-        if is_sensitive:
-            # EXIT CODE 2: Block + Feedback an Claude
-            print(f"BLOCKED: Zugriff auf '{filepath}' verweigert", file=sys.stderr)
-            print(f"Grund: {reason}", file=sys.stderr)
-            print(f"Dies ist eine Sicherheitsmaßnahme um Secrets zu schützen.", file=sys.stderr)
-            print(f"Lösung: Falls du den Inhalt wirklich brauchst, frage den User.", file=sys.stderr)
-            sys.exit(2)
-
-        # Alles OK
+    filepath = None
+    if ctx.tool_name in ('Read', 'Edit', 'Write'):
+        filepath = ctx.tool_input.get('file_path', '')
+    elif ctx.tool_name == 'Bash':
+        command = ctx.tool_input.get('command', '')
+        for sensitive in SENSITIVE_FILENAMES:
+            if sensitive in command.lower():
+                ctx.block(_block_msg(
+                    f"BLOCKED: Bash-Kommando referenziert sensitive Datei '{sensitive}'",
+                    "Grund: Diese Datei könnte Secrets enthalten.",
+                    "Lösung: Verwende .env.example als Template oder frage den User."
+                ))
         sys.exit(0)
 
-    except json.JSONDecodeError:
-        # Ungültiges JSON = durchlassen (fail open)
+    if not filepath:
         sys.exit(0)
-    except Exception as e:
-        # Unerwarteter Fehler = durchlassen (fail open)
-        print(f"block-secrets.py Warnung: {e}", file=sys.stderr)
-        sys.exit(0)
+
+    is_sensitive, reason = is_sensitive_file(filepath)
+
+    if is_sensitive:
+        ctx.block(_block_msg(
+            f"BLOCKED: Zugriff auf '{filepath}' verweigert",
+            f"Grund: {reason}",
+            "Dies ist eine Sicherheitsmaßnahme um Secrets zu schützen.",
+            "Lösung: Falls du den Inhalt wirklich brauchst, frage den User."
+        ))
+
+    sys.exit(0)
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"block-secrets.py Warnung: {e}", file=sys.stderr)
+        sys.exit(0)

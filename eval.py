@@ -59,6 +59,8 @@ def run():
             expected = "auto-session-save"
         elif "#user-gedanke" in text[:300]:
             expected = "user-gedanke"
+        elif "#decision" in text[:300] or "#entscheidung" in text[:300] or text[:20].startswith("DECISION"):
+            expected = "decision"
         elif "#session-save" in text[:300]:
             expected = "session-save"
         if etype == expected:
@@ -174,6 +176,106 @@ def run():
     print(f"  Total user-gedanke: {ug_total}")
     print(f"  Protected (buffer): {ug_buffer}")
     print(f"  Expired before protection: {ug_expired} (pre-S25, before entry_type existed)")
+
+    # 10. NOISE FILTERING ROBUSTNESS
+    print("\n=== 10. NOISE FILTERING ROBUSTNESS ===")
+    all_entries = conn.execute(
+        "SELECT id, entry_type, state, text, reprieve_count FROM buffer_entries"
+    ).fetchall()
+
+    noise, signal, ambiguous = [], [], []
+    for eid, etype, state, text, reprieves in all_entries:
+        # Definite noise
+        if text.strip().startswith("AUTO-SESSION-SAVE") and "User Messages: 0" in text:
+            noise.append((eid, state, "empty-auto-save"))
+        elif len(text.strip()) < 50:
+            noise.append((eid, state, "short-entry"))
+        # Definite signal
+        elif etype == "decision":
+            signal.append((eid, state, "decision"))
+        elif etype == "user-gedanke":
+            signal.append((eid, state, "user-gedanke"))
+        elif "#error-learning" in text[:300]:
+            signal.append((eid, state, "error-learning"))
+        elif state in ("proven", "permanent"):
+            signal.append((eid, state, "promoted"))
+        # Ambiguous
+        else:
+            ambiguous.append((eid, state, etype or "unknown"))
+
+    total = len(all_entries)
+    print(f"  Classification: {len(noise)} noise, {len(signal)} signal, {len(ambiguous)} ambiguous")
+    print(f"  Noise ratio: {100*len(noise)/total:.1f}%")
+
+    # Noise expiry rate (recall): how many noise entries got expired?
+    noise_expired = sum(1 for _, s, _ in noise if s == "expired")
+    noise_total = len(noise)
+    print(f"  Noise expiry rate: {noise_expired}/{noise_total} = {100*noise_expired/noise_total:.0f}%" if noise_total else "  No noise entries")
+
+    # Signal retention rate: how many signal entries survived?
+    signal_alive = sum(1 for _, s, _ in signal if s != "expired")
+    signal_total = len(signal)
+    print(f"  Signal retention: {signal_alive}/{signal_total} = {100*signal_alive/signal_total:.0f}%" if signal_total else "  No signal entries")
+
+    # False positives: signal entries that got expired
+    # Distinguish: expired-by-consolidation (correct) vs expired-by-aging (potential FP)
+    proven_texts = {r[0]: r[1][:200] for r in conn.execute(
+        "SELECT id, text FROM buffer_entries WHERE state IN ('proven', 'permanent')"
+    ).fetchall()}
+    signal_expired = [(eid, cat) for eid, s, cat in signal if s == "expired"]
+    consolidated, actual_fp = [], []
+    for eid, cat in signal_expired:
+        # Check if a proven entry absorbed this one (heuristic: proven with higher ID exists)
+        entry_text = conn.execute("SELECT text FROM buffer_entries WHERE id = ?", (eid,)).fetchone()
+        if entry_text:
+            entry_preview = entry_text[0][:80].lower()
+            # Check if any proven entry covers similar content
+            was_consolidated = any(
+                pid > eid and entry_preview[:40] in ptxt.lower()[:200]
+                for pid, ptxt in proven_texts.items()
+            )
+            if not was_consolidated:
+                # Broader check: proven entry created after this one in same project
+                entry_proj = conn.execute("SELECT project FROM buffer_entries WHERE id = ?", (eid,)).fetchone()[0]
+                later_proven = any(
+                    pid > eid for pid in proven_texts
+                    if conn.execute("SELECT project FROM buffer_entries WHERE id = ?", (pid,)).fetchone()[0] == entry_proj
+                )
+                was_consolidated = later_proven
+            if was_consolidated:
+                consolidated.append((eid, cat))
+            else:
+                actual_fp.append((eid, cat))
+        else:
+            actual_fp.append((eid, cat))
+    print(f"  Signal expired total: {len(signal_expired)}")
+    print(f"    Consolidated (correct): {len(consolidated)}")
+    print(f"    Actual FP (wrongly expired): {len(actual_fp)}")
+    for eid, cat in actual_fp:
+        print(f"      [{eid}] category={cat}")
+
+    # False negatives: noise entries still alive
+    noise_alive = [(eid, cat) for eid, s, cat in noise if s != "expired"]
+    print(f"  Noise still alive (FN): {len(noise_alive)}")
+    for eid, cat in noise_alive:
+        print(f"    [{eid}] category={cat}")
+
+    # Pipeline stage analysis: WHERE was noise caught?
+    print("\n  Pipeline stage analysis (expired entries):")
+    expired_all = conn.execute(
+        "SELECT id, entry_type, text, reprieve_count FROM buffer_entries WHERE state = 'expired'"
+    ).fetchall()
+    stage_add, stage_age, stage_limbo = 0, 0, 0
+    for eid, etype, text, reprieves in expired_all:
+        if text.strip().startswith("AUTO-SESSION-SAVE") and "User Messages: 0" in text:
+            stage_add += 1  # caught at add-time by entry_type detection
+        elif reprieves and reprieves > 0:
+            stage_limbo += 1  # caught after reprieve cycles
+        else:
+            stage_age += 1  # caught by aging/isolation
+    print(f"    At add-time (entry_type): {stage_add}")
+    print(f"    At aging (isolation): {stage_age}")
+    print(f"    At limbo (max reprieves): {stage_limbo}")
 
     conn.close()
     print("\n=== EVALUATION COMPLETE ===")

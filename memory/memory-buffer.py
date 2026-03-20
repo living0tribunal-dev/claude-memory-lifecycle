@@ -1468,6 +1468,7 @@ def consolidate_cluster(entries):
         f"- Keine Meta-Kommentare (\"dieser Eintrag fasst zusammen...\")\n"
         f"- Sprache: wie die Original-Eintraege\n"
         f"- Beginne direkt mit dem Inhalt\n"
+        f"- Bewahre Tags am Textanfang (#decision, #session-save, #error-learning, #user-gedanke, Projektname)\n"
         f"- WICHTIG: Wenn die Eintraege VERSCHIEDENE Themen behandeln, "
         f"erstelle SEPARATE Eintraege pro Thema\n\n"
         f"Eintraege:\n\n{entries_text}\n\n"
@@ -1605,17 +1606,33 @@ def cmd_consolidate(args):
         projects = {entry_projects[eid] for eid, _ in entries if entry_projects.get(eid)}
         cluster_project = projects.pop() if len(projects) == 1 else None
 
+        # Derive entry_type from originals (protected types inherit)
+        PROTECTED_TYPES = ('decision', 'user-gedanke')
+        original_types = set()
+        for eid, _ in entries:
+            etype_row = conn.execute(
+                "SELECT entry_type FROM buffer_entries WHERE id = ?", (eid,)
+            ).fetchone()
+            if etype_row and etype_row[0]:
+                original_types.add(etype_row[0])
+        inherited_type = None
+        for pt in PROTECTED_TYPES:
+            if pt in original_types:
+                inherited_type = pt
+                break
+
         # Store consolidated entries as proven
         now = datetime.now().isoformat()
         new_ids = []
         all_inserted = True
         for result_text in results:
+            entry_type = inherited_type or detect_entry_type(result_text)
             text_hash = compute_hash(result_text)
             try:
                 conn.execute(
                     "INSERT INTO buffer_entries (text, text_hash, state, created_at, project, entry_type) "
                     "VALUES (?, ?, 'proven', ?, ?, ?)",
-                    (result_text, text_hash, now, cluster_project, detect_entry_type(result_text))
+                    (result_text, text_hash, now, cluster_project, entry_type)
                 )
                 new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 new_ids.append(new_id)
@@ -2651,14 +2668,29 @@ def cmd_age(args):
             print(f"  -> EXPIRED (< 50 Zeichen)\n")
             continue
 
-        # Step 4c: Gemini substance check
+        # Step 4c: Substance check (Gemini only on first cycle, then countdown)
+        if reprieves > 0:
+            # Already evaluated as valuable — countdown without API call
+            if dry_run:
+                print(f"  -> WUERDE COUNTDOWN ({reprieves + 1}/{MAX_REPRIEVES}) [--dry-run]\n")
+                continue
+            conn.execute(
+                "UPDATE buffer_entries SET reprieve_count = reprieve_count + 1 WHERE id = ?",
+                (eid,)
+            )
+            conn.commit()
+            reprieved += 1
+            print(f"  -> COUNTDOWN ({reprieves + 1}/{MAX_REPRIEVES}) — kein API-Call\n")
+            continue
+
+        # First cycle: Gemini substance check
         if dry_run:
             print(f"  -> WUERDE Gemini Substance-Check [--dry-run]\n")
             continue
 
         result = substance_check(text)
         if result is None:
-            print(f"  -> SKIP: Gemini-Fehler\n")
+            print(f"  -> SKIP: Gemini-Fehler (wird naechsten Zyklus erneut versucht)\n")
             continue
 
         valuable = result.get('valuable', False)
